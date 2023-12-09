@@ -1,18 +1,21 @@
 import sys
 import time
 import os
-
+import json
 import numpy as np
 from copy import deepcopy
 
 from utils import calculate_perplexity, get_ptb_dataset, Vocab
 from utils import ptb_iterator, sample
 from utils import weights_init
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class Config(object):
   """Holds model hyperparams and data information.
@@ -23,10 +26,10 @@ class Config(object):
   """
   ### YOUR CODE HERE
   batch_size = 64
-  embed_size = 50
+  embed_size = 100
   hidden_size = 100
-  num_steps = 10 # RNN is unfolded into 'num_steps' time steps for training
-  max_epochs = 1 # the number of max epoch
+  num_steps = 15 # RNN is unfolded into 'num_steps' time steps for training
+  max_epochs = 2  # the number of max epoch
   early_stopping = 2
   dropout = 0.1
   lr = 0.01
@@ -42,14 +45,21 @@ class RNNLM_Model(nn.Module):
 
     ### YOUR CODE HERE
     ### Define the Embedding layer. Hint: check nn.Embedding
-
+    self.embedding = nn.Embedding(config.vocab_size, config.embed_size)
+    
     ### Define the H, I, b1 in HW4. Hint: check nn.Parameter
+    # Define RNN parameters
+    self.H = nn.Parameter(torch.Tensor(config.hidden_size, config.hidden_size))
+    self.I = nn.Parameter(torch.Tensor(config.embed_size, config.hidden_size))
+    self.b1 = nn.Parameter(torch.Tensor(config.hidden_size))
 
     ### Define the projection layer, U, b2 in HW4
+    self.U = nn.Parameter(torch.Tensor(config.hidden_size, config.vocab_size))
+    self.b2 = nn.Parameter(torch.Tensor(config.vocab_size))
 
     ## Define the input dropout and output dropout.
-    self.input_drop = 
-    self.output_drop = 
+    self.input_drop = nn.Dropout(config.dropout)
+    self.output_drop = nn.Dropout(config.dropout)
     ### END YOUR CODE
 
     ## Initialize the weights. 
@@ -66,7 +76,7 @@ class RNNLM_Model(nn.Module):
     rnn_outputs, last_state = self.add_model(input_x, initial_state)
     #Compute the prediction of different steps 
     outputs = self.add_projection(rnn_outputs)
-    return outputs, final_state
+    return outputs, last_state
     
 
   def add_embedding(self, input_x):
@@ -83,7 +93,12 @@ class RNNLM_Model(nn.Module):
               a tensor of shape (batch_size, embed_size).
     """
     ### YOUR CODE HERE
-
+    # define embedding layer at init and use it in here:
+    # convert word indices to embeddings
+    embedded = self.embedding(input_x)  # shape: (batch_size, num_steps, embed_size)
+    # allows the RNN to process each timestep sequentially for all sequences simultaneously
+    input_x = torch.split(embedded, split_size_or_sections=1, dim=1) # shape: list of (batch_size, 1, embed_size)
+    input_x = [torch.squeeze(x, dim=1) for x in input_x] # shape: list of (batch_size, embed_size)
     ### END YOUR CODE
     return input_x
 
@@ -111,6 +126,21 @@ class RNNLM_Model(nn.Module):
     input_x = [self.input_drop(x) for x in input_x]
 
     ### YOUR CODE HERE
+    hidden = initial_state
+    rnn_outputs = []
+
+    for x_t in input_x:
+        # Update hidden state
+        hidden = torch.relu(torch.matmul(hidden, self.H) + torch.matmul(x_t, self.I) + self.b1)
+        
+        # Store the output (hidden state)
+        rnn_outputs.append(hidden)
+
+    # Apply dropout to outputs
+    rnn_outputs = [self.output_drop(output) for output in rnn_outputs]
+
+    # The final state is the last hidden state
+    final_state = rnn_outputs[-1]
 
     ### END YOUR CODE
     return rnn_outputs, final_state
@@ -130,7 +160,8 @@ class RNNLM_Model(nn.Module):
                (batch_size, len(vocab))
     """
     ### YOUR CODE HERE
-
+    # Project RNN outputs to the vocabulary size
+    outputs = [torch.matmul(rnn_output, self.U) + self.b2 for rnn_output in rnn_outputs]
     ### END YOUR CODE
     return outputs
 
@@ -141,9 +172,10 @@ class RNNLM_Model(nn.Module):
         Hint: If you are using GPU, the init_hidden should be attached to cuda.
     """
     ### YOUR CODE HERE
-
+    init_state = torch.zeros(self.config.batch_size, self.config.hidden_size)
+    
     ### END YOUR CODE
-    return init_state
+    return init_state.to(device)
     
 
 def generate_text(model, config, vocab,  starting_text='<eos>',
@@ -175,15 +207,16 @@ def generate_text(model, config, vocab,  starting_text='<eos>',
     input_token = tokens[-1]
     input_token = torch.unsqueeze(torch.unsqueeze(torch.tensor(input_token).type(torch.LongTensor), 0), 0)
     ## if you are using cpu, do not attach input_token to cuda. 
-    input_token = input_token.cuda()
+    # input_token = input_token.cuda()
+    input_token = input_token.to(device)
     outputs, state = model(input_token, state)
     ## Here we cast outputs to float64 as there are numerical issues at hand
     # (i.e. sum(output of softmax) = 1.00000298179 and not 1)
     last_pred = outputs[-1][-1].type(torch.float64)
-    prediciton = nn.functional.softmax(last_pred) 
+    prediction = nn.functional.softmax(last_pred) 
 
     ## if you are using cpu, you do not need to change prediciton back to cpu. 
-    next_word_idx = sample(prediciton.data.cpu().numpy(), temperature=temp)
+    next_word_idx = sample(prediction.data.cpu().numpy(), temperature=temp)
     tokens.append(next_word_idx)
     if stop_tokens and vocab.decode(tokens[-1]) in stop_tokens:
       break
@@ -216,7 +249,7 @@ def load_data(debug=False):
   return encoded_train, encoded_valid, encoded_test, vocab
 
 
-def compute_loss(ouputs, y, criterion):
+def compute_loss(outputs, y, criterion):
   """Compute the loss given the ouput, ground truth y, and the criterion function.
 
   Hint: criterion should be cross entropy.
@@ -229,12 +262,17 @@ def compute_loss(ouputs, y, criterion):
     output: A 0-d tensor--averaged loss (scalar)
   """ 
   ### YOUR CODE HERE
-
+   # Concatenate the outputs across all timesteps
+  outputs_concat = torch.cat(outputs, dim=0)
+  # Flatten the target tensor to match the concatenated outputs shape
+  y_flattened = y.transpose(0, 1).contiguous().view(-1)
+  # Compute the loss
+  loss = criterion(outputs_concat, y_flattened)
   ### END YOUR CODE
   return loss
 
 
-def run_epoch(our_model, config, model_optimizer, criterion, data, mode='train', verbose=10):
+def run_epoch(our_model, config, model_optimizer, criterion, data, mode='train', verbose=10, scheduler=None):
   """
   Run for one epoch. Operations are determined by the mode. 
 
@@ -251,12 +289,15 @@ def run_epoch(our_model, config, model_optimizer, criterion, data, mode='train',
       x = torch.from_numpy(x).type(torch.LongTensor)
       y = torch.from_numpy(y).type(torch.LongTensor)
       ## if you are using cpu, do not attach x,y to cuda. 
-      x = x.cuda()
-      y = y.cuda()
+      # x = x.cuda()
+      # y = y.cuda()
+      x = x.to(device)
+      y = y.to(device)
       outputs, state = our_model(x, state)
       loss = compute_loss(outputs, y, criterion)
       if mode=='train':
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(our_model.parameters(), max_norm=1.0)
         model_optimizer.step()
         state= state.detach()
       ## if you are using cpu, you do not need to change loss.data back to cpu. 
@@ -272,18 +313,22 @@ def run_epoch(our_model, config, model_optimizer, criterion, data, mode='train',
 def test_RNNLM():
   config = Config()  
   ### load data
-  train_data, valid_data, test_data, vocab= load_data(debug=False)
+  train_data, valid_data, test_data, vocab=load_data(debug=False)
   config.vocab_size= len(vocab)
+
+  best_config = tune_hyperparameters(config, train_data, valid_data)
+  config = best_config
+
   ### Initialize the model. If you are using cpu, do not attach model to cuda.  
-  our_model = RNNLM_Model(config)
-  our_model.cuda()
+  # our_model = RNNLM_Model(config)
+  our_model = RNNLM_Model(config).to(device)
 
   ### define the loss (criterion), optimizer
   ### Hint: the criterion should be CE and SGD might be a good choice for optimizer. 
 
   ### YOUR CODE HERE
-  criterion = 
-  model_optimizer = 
+  criterion = nn.CrossEntropyLoss()
+  model_optimizer = torch.optim.Adam(our_model.parameters(), lr=config.lr)
   ### END YOUR CODE
 
   best_val_pp = float('inf')
@@ -292,8 +337,8 @@ def test_RNNLM():
   for epoch in range(config.max_epochs):
     print('Epoch {}'.format(epoch))
     start = time.time()
-    train_pp = run_epoch(our_model, config, model_optimizer, criterion,train_data,)
-    valid_pp = run_epoch(our_model, config, model_optimizer, criterion,valid_data,)
+    train_pp = run_epoch(our_model, config, model_optimizer, criterion,train_data, mode='train')
+    valid_pp = run_epoch(our_model, config, model_optimizer, criterion,valid_data, mode='valid')
     print('Training perplexity: {}'.format(train_pp))
     print('Validation perplexity: {}'.format(valid_pp))
     if valid_pp < best_val_pp:
@@ -316,14 +361,75 @@ def test_RNNLM():
   ### Then we generate some sentence..  
   gen_config = deepcopy(config)
   gen_config.batch_size = gen_config.num_steps = 1   
-  gen_model = RNNLM_Model(gen_config)
-  gen_model.cuda()
+  gen_model = RNNLM_Model(gen_config).to(device)
+  # gen_model.cuda()
   gen_model.load_state_dict(checkpoint['net'])
   starting_text = 'in palo alto'
   while starting_text:
     print(' '.join(generate_sentence(
        gen_model, gen_config,vocab, starting_text=starting_text, temp=1.0)))
     starting_text = input('> ')
+
+def tune_hyperparameters(config, train_data, valid_data):
+    # Expanded hyperparameter space
+    learning_rates = [0.01, 0.001]
+    embed_sizes = [50, 100, 200]
+    hidden_sizes = [100, 200]
+    num_steps_options = [10, 20, 30]
+    batch_sizes = [64, 128]
+
+    best_val_pp = float('inf')
+    best_config = None
+    results = []  # To store the results of each hyperparameter set
+
+    for lr in learning_rates:
+        for embed_size in embed_sizes:
+            for hidden_size in hidden_sizes:
+                for num_steps in num_steps_options:
+                    for batch_size in batch_sizes:
+                        # Update config with current set of hyperparameters
+                        config.lr = lr
+                        config.embed_size = embed_size
+                        config.hidden_size = hidden_size
+                        config.num_steps = num_steps
+                        config.batch_size = batch_size
+
+                        # Initialize the model
+                        model = RNNLM_Model(config).to(device)
+                        criterion = nn.CrossEntropyLoss()
+                        model_optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+                        scheduler = torch.optim.lr_scheduler.StepLR(model_optimizer, step_size=30, gamma=0.1)
+
+                        # Train and validate the model
+                        print(f"Training with lr={lr}, embed_size={embed_size}, hidden_size={hidden_size}, num_steps={num_steps}, batch_size={batch_size}")
+                        for epoch in range(config.max_epochs):
+                            run_epoch(model, config, model_optimizer, criterion, train_data, mode='train', scheduler=scheduler)
+                            val_pp = run_epoch(model, config, model_optimizer, criterion, valid_data, mode='valid')
+
+                            # Check if current hyperparameters are better
+                            val_pp = float(val_pp)
+                            if val_pp < best_val_pp:
+                                best_val_pp = val_pp
+                                best_config = deepcopy(config)
+
+                        # Log the results
+                        results.append({
+                            'lr': lr,
+                            'embed_size': embed_size,
+                            'hidden_size': hidden_size,
+                            'num_steps': num_steps,
+                            'batch_size': batch_size,
+                            'val_perplexity': val_pp
+                        })
+
+    print(f"Best Validation Perplexity: {best_val_pp}")
+    print(f"Best Hyperparameters: lr={best_config.lr}, embed_size={best_config.embed_size}, hidden_size={best_config.hidden_size}, num_steps={best_config.num_steps}, batch_size={best_config.batch_size}")
+
+    # Save the results to a JSON file
+    with open('hyperparameter_tuning_results.json', 'w') as f:
+        json.dump(results, f, indent=4)
+
+    return best_config
 
 if __name__ == "__main__":
   os.environ['CUDA_VISIBLE_DEVICES'] = '0'
